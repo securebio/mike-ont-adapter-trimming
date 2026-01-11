@@ -79,7 +79,7 @@ cat reads.fastq | ont-trim --adapter ACGT... | gzip > trimmed.fastq.gz
 ## Algorithm
 
 ### Alignment
-Uses **local alignment with affine gap scoring** from the `bio` crate:
+Uses **semi-global alignment with affine gap scoring** from the `bio` crate (free end gaps on all four ends, matching Porechop ABI's approach):
 - Match: +3
 - Mismatch: -6
 - Gap open: -5
@@ -121,7 +121,9 @@ Uses iterative masking (like Porechop ABI):
 
 ## Implementation Notes
 
-### Architecture Pattern (from nao-rustmasker)
+See [/dev/docs/2025-12-28_implementation-notes.md](./dev/docs/2025-12-28_implementation-notes.md) for more notes about the initial implementation.
+
+### Streaming Architecture Pattern (from nao-rustmasker)
 ```
 Read → Chunk (1000 reads) → Parallel Process → Sequential Write → Repeat
 ```

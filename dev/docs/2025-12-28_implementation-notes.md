@@ -418,3 +418,97 @@ Since you are "reimplementing" a tool, your first goal is logic parity.
 3. If (and only if) the alignment step is the dominant bottleneck (>50% of runtime), replace the internal alignment function with **`parasail-rs`** or **`ksw2-rs`**.
 
 *Note: For simple adapter trimming (short queries), the I/O (reading FASTQ files) and Gzip decompression are often the actual bottlenecks in Rust, not the alignment itself.*
+
+---
+
+# Implementation Documentation
+
+Notes written by Claude about the initial implementation.
+
+## Architecture
+
+### Streaming Pattern
+The streaming architecture is based on [nao-rustmasker](../nao-rustmasker), which provides:
+- Chunk-based processing (default 1000 reads per chunk)
+- Bounded memory usage regardless of input file size
+- Sequential read → parallel process → sequential write pattern
+- Near-linear scaling with CPU cores using Rayon
+
+### Reference Implementation
+Trimming logic follows [Porechop ABI](https://github.com/bonsai-team/Porechop_ABI):
+- Two-tier identity scoring (75% partial for ends, 90% full for middle)
+- Extra trimming beyond adapter boundaries
+- Iterative masking for multiple internal adapters
+
+## Alignment Approach
+
+Claude first tried to use semi-global alignment as implemented in the bio crate, but couldn't get it to work as desired (matching Porechop's 'semi-global alignment' behavior). So it then fell back on using local alignment. However, that approach was hacky. After some back and forth trying to get the bio crate's `semiglobal()` to work, we ended up finding a solution by defining a custom aligner.
+
+### Initial Approach: Local Alignment
+The first implementation used bio crate's `local()` alignment with explicit boundary checks:
+- Performed local alignment to find best adapter match
+- Added boundary validation: `read_start == 0` for start adapters, `read_end == region_len` for end adapters
+- This worked but was a workaround for what should be natural alignment behavior
+
+### Discovery: Bio's Semiglobal Limitation
+Investigation revealed that bio crate's `semiglobal()` function has a critical limitation:
+- It requires ALL of the query (x) sequence to align
+- This means partial adapters at read boundaries cannot be detected
+- Example: A 28bp adapter with only 20bp present at read start would fail to align properly
+
+Testing confirmed this:
+- Full adapter at read start: semiglobal score 84, local score 84 (both work)
+- Partial adapter at read end: semiglobal score -6, local score 33 (semiglobal fails)
+
+### Final Solution: Semi-Global Alignment (Free End Gaps on All Four Ends)
+The solution uses bio crate's `Scoring` struct with custom clipping penalties:
+
+```rust
+let scoring = Scoring::from_scores(GAP_OPEN, GAP_EXTEND, MATCH_SCORE, MISMATCH_SCORE)
+    .xclip(0)   // adapter can be partially aligned (free gaps at adapter ends)
+    .yclip(0);  // adapter can match anywhere in sequence (free gaps at sequence ends)
+
+let mut aligner = Aligner::with_scoring(scoring);
+let alignment = aligner.custom(adapter, sequence);
+```
+
+This creates semi-global alignment with free end gaps on all four ends, exactly matching Porechop ABI's SeqAn configuration: `AlignConfig<true, true, true, true>`.
+
+### Boundary Check Logic
+The boundary checks also match Porechop ABI's approach - rejecting matches that span the entire search region rather than requiring exact boundary touching:
+
+```rust
+let is_valid_match = match region {
+    EndRegion::Start => result.read_end != region_len,  // Must NOT reach end of region
+    EndRegion::End => result.read_start != 0,           // Must NOT start at beginning
+};
+```
+
+This prevents false positives from alignments that span the full search window (which would indicate the "adapter" is actually part of the read sequence).
+
+## Key Technical Details
+
+### Scoring Parameters (Porechop Defaults)
+- Match: +3
+- Mismatch: -6
+- Gap open: -5
+- Gap extend: -2
+
+These affine gap parameters handle ONT's "bursty" indel errors effectively.
+
+### Identity Calculation
+Two identity metrics are used:
+- **Partial identity**: `matches / aligned_adapter_length` - for end adapters
+- **Full identity**: `matches / total_adapter_length` - for middle adapters
+
+### Dependencies
+- `needletail`: FASTQ/FASTA parsing with auto-gzip detection
+- `bio`: Sequence alignment with affine gap scoring
+- `rayon`: Data parallelism
+- `gzp`: Parallel gzip compression
+- `clap`: CLI argument parsing
+
+## References
+- [Porechop ABI](https://github.com/bonsai-team/Porechop_ABI) - Original Python/C++ implementation
+- [nao-rustmasker](../nao-rustmasker) - Reference architecture for streaming/parallelization
+- Gemini conversation on alignment methods (see above)
